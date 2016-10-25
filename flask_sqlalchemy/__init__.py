@@ -21,6 +21,8 @@ from flask import _request_ctx_stack, abort, has_request_context, request
 from flask.signals import Namespace
 from operator import itemgetter
 from threading import Lock
+from contextlib import contextmanager
+from werkzeug.local import LocalStack
 from sqlalchemy import orm, event, inspect
 from sqlalchemy.orm.exc import UnmappedClassError
 from sqlalchemy.orm.session import Session as SessionBase
@@ -170,6 +172,69 @@ class SignallingSession(SessionBase):
                 state = get_state(self.app)
                 return state.db.get_engine(self.app, bind=bind_key)
         return SessionBase.get_bind(self, mapper, clause)
+
+
+class StackedRegistry(object):
+    def __init__(self, createfunc, scopefunc):
+        self.createfunc = createfunc
+        self.scopefunc = scopefunc
+        self.stack = LocalStack()
+        self.stack.__ident_func__ = scopefunc
+
+    def __call__(self):
+        top = self.stack.top
+        if top is None:
+            top = self.createfunc(), True
+            self.stack.push(top)
+        return top[0]
+
+    def has(self):
+        return self.stack.top is not None
+
+    def set(self, obj):
+        assert not self.has()
+        self.stack.push((obj, True))
+
+    def clear(self):
+        self.stack.pop()
+        assert not self.has()
+
+
+class StackedSession(orm.scoped_session):
+    # noinspection PyMissingConstructor
+    def __init__(self, session_factory, scopefunc=None):
+        self.session_factory = session_factory
+        self.registry = StackedRegistry(session_factory, scopefunc)
+
+    @contextmanager
+    def tx(self, force_new=False):
+        top = self.registry.stack.top
+        if not force_new and top is not None and not top[0].autocommit and top[1]:
+            warnings.warn('Closing implicit session')
+            self.registry.stack.pop()
+            top = None
+        if top is None or force_new and not top[0].autocommit and not top[1]:
+            session = self.session_factory()
+            try:
+                self.registry.stack.push((session, False))
+                try:
+                    if session.autocommit:
+                        with session.begin() as tx:
+                            yield tx
+                    else:
+                        try:
+                            yield session.transaction
+                            session.commit()
+                        except:
+                            session.rollback()
+                            raise
+                finally:
+                    self.registry.stack.pop()
+            finally:
+                session.close()
+        else:
+            with top[0].begin(subtransactions=True) as tx:
+                yield tx
 
 
 class _SessionSignalEvents(object):
@@ -761,7 +826,7 @@ class SQLAlchemy(object):
 
         scopefunc = options.pop('scopefunc', connection_stack.__ident_func__)
         options.setdefault('query_cls', self.Query)
-        return orm.scoped_session(self.create_session(options), scopefunc=scopefunc)
+        return StackedSession(self.create_session(options), scopefunc=scopefunc)
 
     def create_session(self, options):
         """Create the session factory used by :meth:`create_scoped_session`.

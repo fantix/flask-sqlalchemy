@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 from __future__ import with_statement
 
+import random
 import unittest
 from datetime import datetime
 
@@ -735,6 +736,59 @@ class StandardSessionTestCase(unittest.TestCase):
         sa.event.listen(db.session, 'after_commit', lambda session: None)
 
 
+class TransactionTestCase(unittest.TestCase):
+    def setUp(self):
+        self.app = flask.Flask(__name__)
+        self.app.config['TESTING'] = True
+        self.app_ctx = self.app.app_context()
+        self.db = fsa.SQLAlchemy()
+        self.db.init_app(self.app)
+        self.Todo = make_todo_model(self.db)
+        self.nonce = random.randint(1, 2147483647)
+        self.app_ctx.push()
+        self.db.create_all()
+
+    def tearDown(self):
+        self.app_ctx.pop()
+
+    def sanity_query(self):
+        self.assertEqual(
+            self.db.session.execute('SELECT {0}'.format(self.nonce)).scalar(),
+            self.nonce)
+
+    def test_no_top(self):
+        self.assertFalse(self.db.session.registry.has())
+        self.assertEqual(
+            self.db.session.execute('SELECT {0}'.format(self.nonce)).scalar(),
+            self.nonce)
+        self.assertTrue(self.db.session.registry.has())
+        self.assertTrue(self.db.session.registry.stack.top[1])
+
+    def test_no_top_tx(self):
+        self.assertFalse(self.db.session.registry.has())
+        with self.db.session.tx():
+            self.sanity_query()
+            self.assertTrue(self.db.session.registry.has())
+            self.assertFalse(self.db.session.registry.stack.top[1])
+        self.assertFalse(self.db.session.registry.has())
+        with self.db.session.tx(force_new=True):
+            self.sanity_query()
+            self.assertTrue(self.db.session.registry.has())
+            self.assertFalse(self.db.session.registry.stack.top[1])
+        self.assertFalse(self.db.session.registry.has())
+
+    def test_subtransaction(self):
+        self.assertFalse(self.db.session.registry.has())
+        with self.db.session.tx():
+            self.sanity_query()
+            self.assertTrue(self.db.session.registry.has())
+            self.assertFalse(self.db.session.registry.stack.top[1])
+            with self.db.session.tx():
+                self.sanity_query()
+                self.assertTrue(self.db.session.registry.has())
+                self.assertFalse(self.db.session.registry.stack.top[1])
+
+
 def suite():
     suite = unittest.TestSuite()
 
@@ -752,6 +806,7 @@ def suite():
     suite.addTest(unittest.makeSuite(SessionScopingTestCase))
     suite.addTest(unittest.makeSuite(CommitOnTeardownTestCase))
     suite.addTest(unittest.makeSuite(CustomModelClassTestCase))
+    suite.addTest(unittest.makeSuite(TransactionTestCase))
 
     if flask.signals_available:
         suite.addTest(unittest.makeSuite(SignallingTestCase))
