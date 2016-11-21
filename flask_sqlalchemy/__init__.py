@@ -208,6 +208,104 @@ class StackedSession(orm.scoped_session):
 
     @contextmanager
     def tx(self, force_new=False):
+        """Safely commits if no errors, will rollback otherwise.
+
+        It is recommended to always put database access code in a `with tx():`
+        block. The block can be nested many times, they all share one outmost
+        transaction. It works similar as `begin(subtransactions=True)` - any
+        nested `rollback` will cause the whole transaction to fail.
+
+        It works similarly as :meth:`begin`, but hides all the details under
+        these scenarios:
+
+        1. The "default" scenario is to use a `try except` block:
+
+            db = SQLAlchemy(app)
+            try:
+                db.session.execute('SELECT now()').scalar()
+                db.session.commit()
+            except:
+                db.session.rollback()
+                raise
+
+        2. And when configured `autocommit=True`:
+
+            db = SQLAlchemy(app, session_options=dict(autocommit=True))
+            with db.session.begin():
+                db.session.execute('SELECT now()').scalar()
+
+        3. `subtransactions=True` can be used on `begin`:
+
+            db = SQLAlchemy(app, session_options=dict(autocommit=True))
+
+            def method():
+                with db.session.begin(subtransactions=True):
+                    # do atomic database operations
+                    return db.session.execute('SELECT now()').scalar()
+
+            # call `method` separately
+            print(method())
+
+            with db.session.begin():
+                db.session.execute('SELECT now()').scalar()
+
+                # or within an ongoing transaction
+                method()
+
+                # here other database access is still allowed
+                db.session.execute('SELECT now()').scalar()
+
+        4. `subtransactions=True` works with `autocommit=False` too, it is only
+           that separate subtransaction doesn't commit for real, it has to be
+           wrapped with a normal `try except` transaction - because an extra
+           `begin` is always implicitly called at the very beginning:
+
+            db = SQLAlchemy(app)
+
+            def method():
+                with db.session.begin(subtransactions=True):
+                    # do atomic database operations
+                    return db.session.execute('SELECT now()').scalar()
+
+            # calling `method` separately is not a complete transaction
+            # print(method())  - don't do this, it leaves an open transaction
+
+            # it has to be like this:
+            try:
+                method()
+                db.session.commit()
+            except:
+                db.session.rollback()
+                raise
+
+        5. Having two separate transactions at the same time. This is useful
+           when you need to immediately execute SQLs that is irrelevant to
+           current transaction, creating trivial logs for example:
+
+            db = SQLAlchemy(app, session_options=dict(autocommit=True))
+
+            with db.session.begin():
+                db.session.execute('SELECT now()').scalar()
+
+                secondary_session = db.session.session_factory()
+                try:
+                    with secondary_session.begin():
+                        secondary_session.execute('INSERT ...')
+                except Exception:
+                    pass
+                finally:
+                    secondary_session.close()
+
+                # here other database access is still allowed
+                db.session.execute('SELECT now()').scalar()
+
+        6. And mixing up all these above, for example creating subtransactions
+           of a secondary transaction which is started in the scope of the
+           subtransaction of another transaction.
+
+        :param force_new:
+        :return:
+        """
         top = self.registry.stack.top
         if not force_new and top is not None and not top[0].autocommit and top[1]:
             warnings.warn('Closing implicit session')
